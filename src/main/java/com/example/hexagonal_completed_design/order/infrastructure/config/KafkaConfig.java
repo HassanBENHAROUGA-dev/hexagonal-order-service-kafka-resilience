@@ -83,7 +83,7 @@ public class KafkaConfig {
     // 5. NOUVEAU : Le convertisseur intelligent qui transforme le String JSON en Objet Java
     /*@Bean
     public RecordMessageConverter converter() {
-        return new JacksonJsonMessageConverter();
+        return new JacksonJsonMessageConverter(); 
     }*/
     @Bean
     public NewTopic orderEventsTopic() {

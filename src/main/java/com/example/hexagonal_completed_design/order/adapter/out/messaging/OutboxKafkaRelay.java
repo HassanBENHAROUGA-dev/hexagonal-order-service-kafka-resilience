@@ -15,7 +15,7 @@ public class OutboxKafkaRelay {
     private final SpringDataOutboxRepository outboxRepository;
     private final KafkaTemplate<Object, Object> kafkaTemplate;
 
-    private static final String TOPIC = "order-events";
+    private static final String TOPIC = "order-events-secure";
 
     public OutboxKafkaRelay(SpringDataOutboxRepository outboxRepository, KafkaTemplate<Object, Object> kafkaTemplate) {
         this.outboxRepository = outboxRepository;

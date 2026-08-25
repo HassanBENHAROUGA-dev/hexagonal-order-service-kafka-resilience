@@ -9,7 +9,7 @@ import org.springframework.stereotype.Component;
 public class OrderEventConsumer {
 
     // 🌟 On écoute avec le groupe 3, et on demande l'objet Kafka BRUT
-    @KafkaListener(topics = "order-events", groupId = "shipping-group-3")
+    @KafkaListener(topics = "order-events-secure", groupId = "shipping-group-3")
     public void consumeOrderEvent(ConsumerRecord<String, String> record) {
 
         System.out.println("🔥 BINGO ! MESSAGE REÇU DE KAFKA !");
@@ -21,7 +21,7 @@ public class OrderEventConsumer {
     }
 
     // Le topic DLT pour la DLQ
-    @KafkaListener(topics = "order-events.DLT", groupId = "shipping-dlq-group-3")
+    @KafkaListener(topics = "order-events-secure.DLT", groupId = "shipping-dlq-group-3")
     public void consumeDLQ(ConsumerRecord<String, String> record) {
 
         System.err.println("🚨 MESSAGE DANS LA DLQ ! Le message " + record.key() + " a échoué 3 fois.");

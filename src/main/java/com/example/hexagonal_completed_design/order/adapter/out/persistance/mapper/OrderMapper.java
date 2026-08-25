@@ -35,13 +35,18 @@ public class OrderMapper {
         }
 
         // 2. On passe les nouvelles valeurs au constructeur de l'Entité
-        return new OrderEntity(
+        OrderEntity entity = new OrderEntity(
                 order.getId().value(),
                 order.getStatus(),
                 itemEntities,
                 discountCode,
                 discountPercentage
         );
+
+        // 🌟 NOUVEAU : On donne la version à JPA
+        entity.setVersion(order.getVersion());
+
+        return entity;
     }
 
     public static Order toDomain(OrderEntity entity) {
@@ -65,7 +70,8 @@ public class OrderMapper {
                 new OrderId(entity.getId()),
                 entity.getStatus(),
                 domainItems,
-                discount // <-- NOUVEAU PARAMÈTRE ICI
+                discount,
+                entity.getVersion()
         );
     }
 }

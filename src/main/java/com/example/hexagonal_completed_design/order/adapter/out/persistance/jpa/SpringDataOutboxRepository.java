@@ -9,4 +9,5 @@ import java.util.UUID;
 public interface SpringDataOutboxRepository extends JpaRepository<OutboxEntity, UUID> {
     // Permet au Relay de récupérer uniquement les événements non envoyés
     List<OutboxEntity> findByProcessedFalseOrderByCreatedAtAsc();
+    List<OutboxEntity> findByProcessedFalse();
 }

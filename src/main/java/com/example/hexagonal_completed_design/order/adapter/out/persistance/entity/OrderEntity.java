@@ -15,6 +15,9 @@ public class OrderEntity {
     @Id
     private UUID id;
 
+    @Version
+    private Long version;
+
     @Enumerated(EnumType.STRING)
     private OrderStatus status;
 
@@ -52,4 +55,7 @@ public class OrderEntity {
     public void setStatus(OrderStatus status) { this.status = status; }
     public List<OrderItemEntity> getItems() { return items; }
     public void setItems(List<OrderItemEntity> items) { this.items = items; }
+
+    public Long getVersion() { return version; }
+    public void setVersion(Long version) { this.version = version; }
 }

@@ -9,6 +9,7 @@ import com.example.hexagonal_completed_design.order.application.port.out.Payment
 import com.example.hexagonal_completed_design.order.application.port.out.ShipPort;
 import com.example.hexagonal_completed_design.order.domain.aggregate.Order;
 import com.example.hexagonal_completed_design.order.domain.aggregate.OrderItem;
+import com.example.hexagonal_completed_design.order.domain.exception.OrderBusinessException;
 import com.example.hexagonal_completed_design.order.domain.exception.PromoCodeException;
 import com.example.hexagonal_completed_design.order.domain.repository.OrderRepository;
 import com.example.hexagonal_completed_design.order.domain.valueobject.*;
@@ -123,7 +124,7 @@ public class OrderApplicationService implements ManageOrderUseCase {
 
     private Order getOrder(OrderId id) {
         return orderRepository.findById(id)
-                .orElseThrow(() -> new IllegalArgumentException("Order not found with id: " + id.value()));
+                .orElseThrow(() -> new OrderBusinessException("Order not found with id: " + id.value()));
     }
 
     private void saveAndPublish(Order order) {

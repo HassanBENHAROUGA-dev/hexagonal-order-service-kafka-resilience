@@ -5,4 +5,9 @@ import com.example.hexagonal_completed_design.order.domain.valueobject.OrderId;
 
 import java.time.Instant;
 
-public record OrderCreatedEvent(OrderId orderId, Instant occurredOn) implements DomainEvent {}
+public record OrderCreatedEvent(OrderId orderId, Instant occurredOn) implements DomainEvent {
+    @Override
+    public String getAggregateId() {
+        return orderId().value().toString();
+    }
+}

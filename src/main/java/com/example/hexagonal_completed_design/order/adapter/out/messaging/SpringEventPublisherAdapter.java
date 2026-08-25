@@ -5,6 +5,7 @@ import com.example.hexagonal_completed_design.order.domain.domainEvent.DomainEve
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Component;
 
+/*
 @Component
 public class SpringEventPublisherAdapter implements EventPublisherPort {
 
@@ -20,4 +21,4 @@ public class SpringEventPublisherAdapter implements EventPublisherPort {
         publisher.publishEvent(event);
         System.out.println("Published event: " + event.getClass().getSimpleName());
     }
-}
+}*/

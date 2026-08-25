@@ -20,6 +20,8 @@ public class OutboxEntity {
     private UUID id;
 
     private String aggregateId;
+
+    @Getter @Setter
     private String eventType;
 
     @Getter

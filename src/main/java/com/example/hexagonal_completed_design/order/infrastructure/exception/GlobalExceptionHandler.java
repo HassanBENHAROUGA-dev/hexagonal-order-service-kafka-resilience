@@ -4,6 +4,7 @@ import com.example.hexagonal_completed_design.order.domain.exception.OrderBusine
 import com.example.hexagonal_completed_design.order.domain.exception.PromoCodeException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
+import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
@@ -31,7 +32,7 @@ public class GlobalExceptionHandler {
     }
 
     @ExceptionHandler(PromoCodeException.class)
-    public ProblemDetail handlePromoCodeException(OrderBusinessException ex) {
+    public ProblemDetail handlePromoCodeException(PromoCodeException ex) {
         ProblemDetail problemDetail = ProblemDetail.forStatusAndDetail(
                 HttpStatus.NOT_FOUND,
                 ex.getMessage()
@@ -52,6 +53,17 @@ public class GlobalExceptionHandler {
                 ex.getMessage()
         );
         problemDetail.setTitle("Invalid Input");
+        return problemDetail;
+    }
+
+    @ExceptionHandler(ObjectOptimisticLockingFailureException.class)
+    public ProblemDetail handleOptimisticLocking(ObjectOptimisticLockingFailureException ex) {
+        ProblemDetail problemDetail = ProblemDetail.forStatusAndDetail(
+                HttpStatus.CONFLICT, // HTTP 409
+                "La commande a été modifiée par un autre processus. Veuillez rafraîchir et réessayer."
+        );
+        problemDetail.setTitle("Concurrency Conflict");
+        problemDetail.setProperty("timestamp", Instant.now());
         return problemDetail;
     }
 }

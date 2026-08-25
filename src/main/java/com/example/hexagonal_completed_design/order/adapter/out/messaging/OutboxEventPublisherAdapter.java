@@ -4,7 +4,6 @@ import com.example.hexagonal_completed_design.order.adapter.out.persistance.enti
 import com.example.hexagonal_completed_design.order.adapter.out.persistance.jpa.SpringDataOutboxRepository;
 import com.example.hexagonal_completed_design.order.application.port.out.EventPublisherPort;
 import com.example.hexagonal_completed_design.order.domain.domainEvent.DomainEvent;
-import com.fasterxml.jackson.core.JsonProcessingException;
 import org.springframework.context.annotation.Primary;
 import org.springframework.stereotype.Component;
 import tools.jackson.databind.ObjectMapper;

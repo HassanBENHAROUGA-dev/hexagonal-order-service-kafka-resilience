@@ -21,6 +21,8 @@ public class Order extends AggregateRoot<OrderId> {
     @Getter
     private Discount discount;
 
+    @Getter
+    private Long version;
     // Constructeur privé : on force l'utilisation de méthodes de création métier
     private Order(OrderId id) {
         super(id);
@@ -96,11 +98,12 @@ public class Order extends AggregateRoot<OrderId> {
         return status;
     }
 
-    public static Order restore(OrderId id, OrderStatus status, List<OrderItem> items, Discount discount) {
+    public static Order restore(OrderId id, OrderStatus status, List<OrderItem> items, Discount discount, Long version) {
         Order order = new Order(id);
         order.status = status;
         order.items.addAll(items);
         order.discount = discount; // On restaure l'état
+        order.version = version;
         return order;
     }
 

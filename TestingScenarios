@@ -1,0 +1,1485 @@
+# Kafka Resilience — Manual Test Scenarios
+
+This section documents the manual scenarios used to validate the reliability mechanisms implemented around Kafka, the Transactional Outbox Pattern and the idempotent consumer.
+
+The goal of these tests is to verify the behavior of the system under real failure conditions rather than only validating the happy path.
+
+---
+
+## Test Overview
+
+| Test    | Scenario                                  | Validates                                 | Status |
+| ------- | ----------------------------------------- | ----------------------------------------- | ------ |
+| TEST-01 | Consumer failure → retries → DLT          | Retry policy and Dead Letter Topic        | ✅      |
+| TEST-02 | Missing `eventId`                         | Non-retryable errors → immediate DLT      | ✅      |
+| TEST-03 | Same `eventId` received twice             | Idempotent Consumer                       | ✅      |
+| TEST-04 | Business failure after idempotency insert | Transaction rollback                      | ✅      |
+| TEST-05 | Kafka unavailable during publication      | Transactional Outbox                      | ✅      |
+| TEST-06 | One Kafka broker unavailable              | Replication / availability with 2 ISR     | ✅      |
+| TEST-07 | Insufficient ISR                          | `acks=all` + `min.insync.replicas=2`      | ✅      |
+| TEST-08 | Broker restart                            | Replica catch-up and ISR recovery         | ✅      |
+| TEST-09 | Locate record / partition / replica       | Kafka storage and replication diagnostics | ✅ / 🔎 |
+| TEST-10 | Kafka ACK then application crash          | Outbox at-least-once redelivery           | ⏳      |
+
+---
+
+# TEST-01 — Consumer Failure → Retry → DLT
+
+## Objective
+
+Verify that a retryable consumer failure results in:
+
+```text
+initial attempt
+→ retry 1
+→ retry 2
+→ retry 3
+→ Dead Letter Topic
+```
+
+The configured backoff is:
+
+```java
+FixedBackOff backOff = new FixedBackOff(1000L, 3);
+```
+
+This means:
+
+```text
+1 initial attempt
++ 3 retries
+= 4 total attempts
+```
+
+---
+
+## Temporary Test Preparation
+
+Temporarily add the following block inside:
+
+```text
+OrderEventConsumer.consume()
+```
+
+before the idempotent processor:
+
+```java
+if (record.value().contains(
+        "99999999-9999-9999-9999-999999999999"
+)) {
+    throw new RuntimeException(
+            "Intentional Retry + DLT test failure"
+    );
+}
+```
+
+The UUID is reserved only for this manual failure-injection test.
+
+---
+
+## Action
+
+Create an order using the reserved UUID:
+
+```bash
+curl -X POST \
+  http://localhost:8080/api/v1/orders/99999999-9999-9999-9999-999999999999
+```
+
+---
+
+## Expected Result
+
+The consumer must fail four times:
+
+```text
+Attempt 1
+↓
+Retry 1
+↓
+Retry 2
+↓
+Retry 3
+↓
+Retries exhausted
+↓
+order-events-secure.DLT
+```
+
+---
+
+## Verify the DLT
+
+```bash
+docker exec kafka-1 /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server kafka-1:29092 \
+  --topic order-events-secure.DLT \
+  --from-beginning
+```
+
+The payload containing:
+
+```text
+99999999-9999-9999-9999-999999999999
+```
+
+must be present.
+
+---
+
+## What This Proves
+
+A retryable consumer failure does not silently lose the event.
+
+```text
+processing failure
+→ retries
+→ retries exhausted
+→ record quarantined in DLT
+```
+
+---
+
+## Cleanup
+
+Remove the temporary failure block after the test.
+
+It must not remain in production code.
+
+---
+
+# TEST-02 — Missing `eventId` → Immediate DLT
+
+## Objective
+
+Verify that a structurally invalid Kafka record is **not retried unnecessarily**.
+
+A missing `eventId` cannot be repaired by retrying the exact same record.
+
+---
+
+## Consumer Protection
+
+The consumer checks the required Kafka header:
+
+```java
+Header eventIdHeader =
+        record.headers().lastHeader("eventId");
+
+if (eventIdHeader == null) {
+    throw new MissingEventIdException(
+            "Missing required Kafka header: eventId"
+    );
+}
+```
+
+The error handler declares this exception as non-retryable:
+
+```java
+errorHandler.addNotRetryableExceptions(
+        MissingEventIdException.class
+);
+```
+
+---
+
+## Action
+
+Produce a message manually without the required header:
+
+```bash
+echo '{"test":"missing-event-id"}' | docker exec -i kafka-1 \
+  /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server kafka-1:29092 \
+  --topic order-events-secure
+```
+
+---
+
+## Expected Result
+
+```text
+record received
+↓
+eventId header missing
+↓
+MissingEventIdException
+↓
+NO retry
+↓
+DLT immediately
+```
+
+There must not be three:
+
+```text
+Record in retry and not yet recovered
+```
+
+messages.
+
+---
+
+## Verify the DLT
+
+```bash
+docker exec kafka-1 /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server kafka-1:29092 \
+  --topic order-events-secure.DLT \
+  --from-beginning \
+  --timeout-ms 5000 | grep 'missing-event-id'
+```
+
+Expected:
+
+```text
+{"test":"missing-event-id"}
+```
+
+---
+
+## What This Proves
+
+The application distinguishes between recoverable and non-recoverable errors.
+
+```text
+temporary failure
+→ retry
+
+structural invalid message
+→ DLT directly
+```
+
+This prevents useless retries for records that can never become valid.
+
+---
+
+# TEST-03 — Idempotent Consumer
+
+## Objective
+
+Verify that receiving the same logical event twice does not execute the business operation twice.
+
+The important identifier here is:
+
+```text
+eventId
+```
+
+not the Kafka key / `aggregateId`.
+
+---
+
+## Step 1 — Process a Normal Event
+
+Create an order normally.
+
+Example:
+
+```text
+aggregateId =
+11111111-2222-3333-4444-555555555555
+```
+
+The Outbox created an event with:
+
+```text
+eventId =
+78d61358-7364-4d30-87f2-821ef7cd8106
+```
+
+The consumer processed it successfully.
+
+The `eventId` is now stored in:
+
+```text
+processed_messages
+```
+
+---
+
+## Step 2 — Send the Same `eventId` Again
+
+Manually publish another Kafka record using exactly the same `eventId`:
+
+```bash
+printf 'eventId:78d61358-7364-4d30-87f2-821ef7cd8106\t11111111-2222-3333-4444-555555555555\t{"test":"duplicate-event"}\n' | \
+docker exec -i kafka-1 /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server kafka-1:29092 \
+  --topic order-events-secure \
+  --property parse.headers=true \
+  --property parse.key=true
+```
+
+---
+
+## Expected Result
+
+The second delivery must not execute the business logic.
+
+Expected log:
+
+```text
+Duplicate order event ignored
+[eventId=78d61358-7364-4d30-87f2-821ef7cd8106]
+```
+
+---
+
+## Internal Flow
+
+First delivery:
+
+```text
+eventId
+↓
+INSERT processed_messages
+↓
+success
+↓
+business logic executed
+↓
+COMMIT
+```
+
+Second delivery:
+
+```text
+same eventId
+↓
+INSERT processed_messages
+↓
+primary-key / unique constraint violation
+↓
+duplicate detected
+↓
+business logic NOT executed
+```
+
+---
+
+## Important
+
+A duplicate is considered successfully handled.
+
+Therefore it is:
+
+```text
+NOT retried
+NOT sent to the DLT
+NOT processed again
+```
+
+---
+
+## What This Proves
+
+Kafka may deliver the same logical event more than once.
+
+The application guarantees:
+
+```text
+at-least-once delivery
++
+idempotent consumer
+=
+single business effect
+```
+
+---
+
+# TEST-04 — Rollback of Consumer Idempotency
+
+## Objective
+
+Verify that an event is not permanently marked as processed when its business processing fails.
+
+---
+
+## Transaction Under Test
+
+```java
+@Transactional
+public void process(
+        String messageId,
+        String payload,
+        Runnable businessLogic
+) {
+
+    repository.insertIdempotent(
+            messageId,
+            LocalDateTime.now()
+    );
+
+    businessLogic.run();
+}
+```
+
+Both operations belong to the same database transaction:
+
+```text
+INSERT processed_messages
++
+business processing
+```
+
+---
+
+## Temporary Test Preparation
+
+Temporarily throw an exception inside the business processing:
+
+```java
+idempotentProcessor.process(eventId, payload, () -> {
+
+    throw new RuntimeException(
+            "Intentional rollback test"
+    );
+});
+```
+
+---
+
+## Expected Behavior
+
+```text
+BEGIN TRANSACTION
+↓
+INSERT eventId
+↓
+business processing
+↓
+RuntimeException
+↓
+ROLLBACK
+```
+
+The `processed_messages` insertion must be rolled back too.
+
+---
+
+## Observed Result
+
+The same event:
+
+```text
+eventId =
+975c60cc-061d-44ac-985d-7af6faa7d7b1
+```
+
+was accepted during every Kafka retry.
+
+Four business-processing attempts were observed.
+
+---
+
+## Why This Proves the Rollback
+
+If the first `processed_messages` insert had been committed:
+
+```text
+Attempt 1
+→ INSERT eventId
+→ business failure
+→ eventId remains in DB
+```
+
+then retry 1 would have immediately produced:
+
+```text
+Duplicate event
+```
+
+Instead, every retry entered the business processing again.
+
+Therefore:
+
+```text
+business failure
+→ transaction rollback
+→ eventId insert rollback
+→ Kafka retry allowed
+```
+
+---
+
+## Cleanup
+
+Remove the temporary exception after the test.
+
+---
+
+# TEST-05 — Transactional Outbox During Kafka Failure
+
+## Objective
+
+Verify that a committed business operation does not lose its domain event when Kafka is unavailable.
+
+This is the main property of the Transactional Outbox Pattern.
+
+---
+
+## Initial State
+
+The application writes:
+
+```text
+Order
++
+OutboxEvent
+```
+
+inside the business database transaction.
+
+Kafka publication happens later through:
+
+```text
+OutboxKafkaRelay
+```
+
+---
+
+## Step 1 — Stop Kafka
+
+```bash
+docker stop kafka-1 kafka-2 kafka-3
+```
+
+---
+
+## Step 2 — Create an Order
+
+Use a new UUID:
+
+```bash
+curl -X POST \
+  http://localhost:8080/api/v1/orders/77777777-7777-7777-7777-777777777777
+```
+
+---
+
+## Expected Database State
+
+Even though Kafka is unavailable:
+
+```text
+Order             → stored
+OutboxEvent       → stored
+processed         → false
+Kafka publication → failed
+```
+
+The business request does not depend on immediate Kafka availability.
+
+---
+
+## Relay Behavior
+
+The Relay runs periodically:
+
+```java
+@Scheduled(fixedDelay = 5000)
+```
+
+Every five seconds:
+
+```text
+find processed=false
+↓
+attempt Kafka publication
+↓
+Kafka unavailable
+↓
+publication fails
+↓
+processed remains false
+```
+
+---
+
+## Step 3 — Restart Kafka
+
+```bash
+docker start kafka-1 kafka-2 kafka-3
+```
+
+Do **not** repeat the HTTP POST.
+
+---
+
+## Expected Result
+
+Once Kafka is available again:
+
+```text
+Relay finds existing processed=false event
+↓
+publication succeeds
+↓
+Kafka ACK
+↓
+processed=true
+↓
+consumer receives event
+```
+
+---
+
+## What This Proves
+
+Without an Outbox:
+
+```text
+Order committed
+↓
+Kafka unavailable
+↓
+event potentially lost
+```
+
+With the Outbox:
+
+```text
+Order committed
++
+event intent persisted
+↓
+Kafka unavailable
+↓
+event remains pending
+↓
+Kafka returns
+↓
+event published automatically
+```
+
+This validates the core purpose of the **Transactional Outbox Pattern**.
+
+---
+
+# TEST-06 — One Kafka Broker Unavailable
+
+## Objective
+
+Verify that Kafka can still accept publications after losing one broker.
+
+Configuration:
+
+```text
+Replication Factor = 3
+min.insync.replicas = 2
+acks = all
+```
+
+---
+
+## Step 1 — Stop One Broker
+
+```bash
+docker stop kafka-3
+```
+
+---
+
+## Step 2 — Inspect the Topic
+
+```bash
+docker exec kafka-1 /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka-1:29092 \
+  --describe \
+  --topic order-events-secure
+```
+
+Observed:
+
+```text
+Partition 0 → Isr: 1,2
+Partition 1 → Isr: 1,2
+Partition 2 → Isr: 1,2
+```
+
+---
+
+## Step 3 — Produce a New Event
+
+Create another Order using a unique UUID.
+
+Example:
+
+```text
+66666666-6666-6666-6666-666666666669
+```
+
+---
+
+## Expected Result
+
+Publication still succeeds because:
+
+```text
+ISR = 2
+minISR = 2
+```
+
+Therefore:
+
+```text
+2 ISR >= minISR
+→ Kafka accepts the write
+```
+
+---
+
+## What This Proves
+
+The cluster tolerates one broker failure without losing write availability.
+
+```text
+3 brokers
+↓
+1 broker fails
+↓
+2 synchronized replicas remain
+↓
+publication still possible
+```
+
+---
+
+# TEST-07 — Insufficient ISR Prevents Publication
+
+## Objective
+
+Verify that Kafka refuses a successful write when the configured durability level can no longer be satisfied.
+
+Configuration:
+
+```text
+acks = all
+min.insync.replicas = 2
+```
+
+---
+
+## Initial State
+
+Keep `kafka-3` stopped.
+
+Then reduce the number of available nodes further.
+
+Example:
+
+```bash
+docker stop kafka-2
+```
+
+Only one broker remains.
+
+---
+
+## Expected Result
+
+The producer attempts publication, but Kafka cannot satisfy:
+
+```text
+min.insync.replicas = 2
+```
+
+Therefore the publication cannot be confirmed.
+
+---
+
+## Expected Outbox State
+
+The Order remains committed.
+
+The corresponding Outbox event remains:
+
+```text
+processed=false
+```
+
+because the code only executes:
+
+```java
+entity.setProcessed(true);
+```
+
+after:
+
+```java
+kafkaTemplate.send(record).get();
+```
+
+has succeeded.
+
+---
+
+## Expected Flow
+
+```text
+Order stored
+↓
+Outbox event stored
+↓
+Kafka send attempted
+↓
+not enough available/synchronized replicas
+↓
+send fails
+↓
+processed remains false
+```
+
+When the cluster becomes healthy again:
+
+```text
+Relay retries
+↓
+send succeeds
+↓
+processed=true
+```
+
+---
+
+## What This Proves
+
+Kafka prefers temporarily refusing writes rather than acknowledging writes below the configured durability requirement.
+
+The Outbox preserves the event until publication becomes possible again.
+
+---
+
+## Important KRaft Note
+
+The three containers in this project are combined:
+
+```text
+broker + KRaft controller
+```
+
+With only one of three nodes alive, the KRaft controller quorum also loses its majority.
+
+Therefore this particular failure test demonstrates the expected cluster unavailability, but it does not isolate `min.insync.replicas` from the controller-quorum constraint.
+
+---
+
+# TEST-08 — Replica Catch-Up After Broker Restart
+
+## Objective
+
+Verify that a broker which was offline retrieves the records produced while it was unavailable.
+
+---
+
+## Initial State
+
+During TEST-06:
+
+```text
+kafka-3 = stopped
+```
+
+A record was produced while only brokers 1 and 2 were in the ISR.
+
+Example:
+
+```text
+aggregateId =
+66666666-6666-6666-6666-666666666669
+```
+
+---
+
+## Step 1 — Check ISR Before Restart
+
+```bash
+docker exec kafka-1 /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka-1:29092 \
+  --describe \
+  --topic order-events-secure
+```
+
+Before `kafka-3` returned:
+
+```text
+Replicas: 3,1,2
+Isr:      1,2
+```
+
+This means:
+
+```text
+broker 3 = assigned replica
+broker 3 = not synchronized
+```
+
+---
+
+## Step 2 — Restart Broker 3
+
+```bash
+docker start kafka-3
+```
+
+---
+
+## Step 3 — Inspect the Topic Again
+
+```bash
+docker exec kafka-1 /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka-1:29092 \
+  --describe \
+  --topic order-events-secure
+```
+
+Observed after recovery:
+
+```text
+Partition 0
+Leader: 2
+Replicas: 2,3,1
+Isr: 1,2,3
+
+Partition 1
+Leader: 3
+Replicas: 3,1,2
+Isr: 1,2,3
+
+Partition 2
+Leader: 1
+Replicas: 1,2,3
+Isr: 1,2,3
+```
+
+---
+
+## Expected Interpretation
+
+```text
+kafka-3 restarts
+↓
+detects missing records
+↓
+fetches missing partition data
+↓
+catches up
+↓
+returns to ISR
+```
+
+---
+
+## Important
+
+Replica catch-up is **not consumer processing**.
+
+Kafka internally copying the record:
+
+```text
+broker 1 → broker 3
+```
+
+does not cause the Spring consumer to execute the business logic again.
+
+---
+
+## What This Proves
+
+Kafka can recover replica consistency after temporary broker failure.
+
+---
+
+# TEST-09 — Locate Record, Partition, Offset and Local Replica
+
+## Objective
+
+Inspect where a specific Kafka record is stored.
+
+This is mainly a diagnostic / educational scenario.
+
+---
+
+## Step 1 — Find Partition and Offset
+
+For:
+
+```text
+66666666-6666-6666-6666-666666666669
+```
+
+run:
+
+```bash
+docker exec kafka-1 /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server kafka-1:29092 \
+  --topic order-events-secure \
+  --from-beginning \
+  --timeout-ms 5000 \
+  --property print.partition=true \
+  --property print.offset=true | \
+  grep '66666666-6666-6666-6666-666666666669'
+```
+
+Observed:
+
+```text
+Partition:1
+Offset:25
+```
+
+Therefore:
+
+```text
+Topic     = order-events-secure
+Partition = 1
+Offset    = 25
+```
+
+---
+
+## Step 2 — Verify Partition Replicas
+
+```bash
+docker exec kafka-1 /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka-1:29092 \
+  --describe \
+  --topic order-events-secure
+```
+
+Example:
+
+```text
+Partition: 1
+Leader:    3
+Replicas:  3,1,2
+Isr:       1,2,3
+```
+
+This means Partition 1 exists on:
+
+```text
+broker 1
+broker 2
+broker 3
+```
+
+---
+
+## Step 3 — Locate Partition Storage on Broker 3
+
+```bash
+docker exec kafka-3 sh -lc \
+'find /tmp /var /opt -type d -name "order-events-secure-1" 2>/dev/null'
+```
+
+Observed:
+
+```text
+/tmp/kafka-logs/order-events-secure-1
+```
+
+Kafka therefore stores the local Partition 1 replica in this directory.
+
+---
+
+## Optional — Inspect the Local Kafka Log
+
+```bash
+docker exec kafka-3 sh -lc \
+'/opt/kafka/bin/kafka-dump-log.sh \
+ --files /tmp/kafka-logs/order-events-secure-1/*.log \
+ --print-data-log 2>/dev/null | \
+ grep "66666666-6666-6666-6666-666666666669"'
+```
+
+This can be used to inspect whether the exact record exists inside the broker's local partition log.
+
+---
+
+## What This Proves
+
+A Kafka record belongs to:
+
+```text
+one topic
+one partition
+one offset inside that partition
+```
+
+It does **not** exist in all three partitions.
+
+Instead:
+
+```text
+record
+↓
+Partition 1
+↓
+Partition 1 replicated across brokers
+```
+
+With replication factor 3:
+
+```text
+Broker 1 → Partition 1 replica
+Broker 2 → Partition 1 replica
+Broker 3 → Partition 1 replica
+```
+
+---
+
+# TEST-10 — Kafka ACK Then Crash Before `processed=true`
+
+## Status
+
+```text
+NOT EXECUTED YET
+```
+
+## Objective
+
+Validate the classic at-least-once delivery window of the Transactional Outbox.
+
+---
+
+## Failure Window
+
+The Relay currently performs:
+
+```java
+kafkaTemplate.send(record).get();
+
+entity.setProcessed(true);
+
+outboxRepository.save(entity);
+```
+
+There is a small failure window between:
+
+```text
+Kafka ACK
+```
+
+and:
+
+```text
+processed=true committed in database
+```
+
+---
+
+## Scenario to Test
+
+```text
+Outbox processed=false
+↓
+Relay sends event
+↓
+Kafka accepts event
+↓
+Kafka ACK
+↓
+APPLICATION CRASH
+↓
+processed=true never committed
+```
+
+After restart:
+
+```text
+Outbox still says processed=false
+↓
+Relay publishes same event again
+↓
+same eventId
+↓
+consumer receives duplicate
+↓
+processed_messages detects duplicate
+↓
+business logic not executed again
+```
+
+---
+
+## Why This Test Matters
+
+This demonstrates why the architecture is described as:
+
+```text
+Transactional Outbox
++
+At-Least-Once Delivery
++
+Idempotent Consumer
+```
+
+and not as guaranteed end-to-end exactly-once delivery.
+
+---
+
+# DLT Configuration Verification
+
+This is a configuration verification, not a business-failure scenario.
+
+---
+
+## Verify DLT Partitions and Replication
+
+```bash
+docker exec kafka-1 /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka-1:29092 \
+  --describe \
+  --topic order-events-secure.DLT
+```
+
+Expected:
+
+```text
+PartitionCount: 3
+ReplicationFactor: 3
+```
+
+Each partition must have replicas on all three brokers.
+
+---
+
+## Verify `min.insync.replicas`
+
+```bash
+docker exec kafka-1 /opt/kafka/bin/kafka-configs.sh \
+  --bootstrap-server kafka-1:29092 \
+  --entity-type topics \
+  --entity-name order-events-secure.DLT \
+  --describe
+```
+
+Expected:
+
+```text
+min.insync.replicas=2
+```
+
+---
+
+# Useful Diagnostic Commands
+
+These commands are not separate test scenarios.
+
+They are utilities used during the scenarios above.
+
+---
+
+## Describe Main Topic
+
+```bash
+docker exec kafka-1 /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka-1:29092 \
+  --describe \
+  --topic order-events-secure
+```
+
+---
+
+## Describe DLT
+
+```bash
+docker exec kafka-1 /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka-1:29092 \
+  --describe \
+  --topic order-events-secure.DLT
+```
+
+---
+
+## List Topics
+
+```bash
+docker exec kafka-1 /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka-1:29092 \
+  --list
+```
+
+---
+
+## Consume Main Topic
+
+```bash
+docker exec kafka-1 /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server kafka-1:29092 \
+  --topic order-events-secure \
+  --from-beginning
+```
+
+---
+
+## Consume DLT
+
+```bash
+docker exec kafka-1 /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server kafka-1:29092 \
+  --topic order-events-secure.DLT \
+  --from-beginning
+```
+
+---
+
+## Stop a Broker
+
+```bash
+docker stop kafka-3
+```
+
+---
+
+## Start a Broker
+
+```bash
+docker start kafka-3
+```
+
+---
+
+# Final Validation Summary
+
+## Retry & Error Handling
+
+```text
+TEST-01
+Retryable failure
+→ initial attempt + 3 retries
+→ DLT
+✅
+```
+
+```text
+TEST-02
+Permanent malformed message
+→ no retry
+→ DLT immediately
+✅
+```
+
+---
+
+## Consumer Reliability
+
+```text
+TEST-03
+Same eventId delivered twice
+→ business executed once
+✅
+```
+
+```text
+TEST-04
+Business processing fails
+→ idempotency marker rolled back
+→ Kafka can retry
+✅
+```
+
+---
+
+## Transactional Outbox
+
+```text
+TEST-05
+Kafka unavailable
+→ Order remains committed
+→ event remains processed=false
+→ automatically published when Kafka returns
+✅
+```
+
+```text
+TEST-10
+Kafka ACK
+→ crash before processed=true
+→ event republished
+→ consumer blocks duplicate
+⏳
+```
+
+---
+
+## Kafka Replication
+
+```text
+TEST-06
+1 broker down
+→ 2 ISR remain
+→ publication continues
+✅
+```
+
+```text
+TEST-07
+insufficient replicas / unavailable cluster
+→ publication not acknowledged
+→ Outbox retains event
+✅
+```
+
+```text
+TEST-08
+broker restarts
+→ catches up
+→ rejoins ISR
+✅
+```
+
+---
+
+## Kafka Storage
+
+```text
+TEST-09
+record located by:
+topic
++ partition
++ offset
+
+partition replica found on broker disk
+✅ / diagnostic
+```
+
+---
+
+# Architecture Validated
+
+The system is intentionally designed around:
+
+```text
+Transactional Outbox
+        +
+At-Least-Once Event Delivery
+        +
+Idempotent Consumer
+        +
+Kafka acks=all
+        +
+Replication Factor = 3
+        +
+min.insync.replicas = 2
+        +
+Retry Policy
+        +
+Dead Letter Topic
+```
+
+The combination protects against two opposite failure modes:
+
+```text
+Kafka unavailable before publication
+→ Outbox prevents event loss
+```
+
+and:
+
+```text
+same event delivered more than once
+→ Idempotent Consumer prevents duplicate business effects
+```

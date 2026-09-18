@@ -30,7 +30,7 @@ public class OutboxEventPublisherAdapter implements EventPublisherPort {
         // Création de la ligne en base de données
         OutboxEntity outboxEntity = new OutboxEntity(
                 UUID.randomUUID(),
-                extractAggregateId(event), // Pseudo-méthode pour récupérer l'ID
+                event.getAggregateId(),// Pseudo-méthode pour récupérer l'ID
                 event.getClass().getSimpleName(),
                 payload,
                 event.occurredOn()
@@ -39,10 +39,5 @@ public class OutboxEventPublisherAdapter implements EventPublisherPort {
         // Sauvegarde dans la même transaction que l'Aggregate Order !
         outboxRepository.save(outboxEntity);
 
-    }
-
-    private String extractAggregateId(DomainEvent event) {
-        // Dans un vrai projet, DomainEvent forcerait une méthode getAggregateId()
-        return "N/A";
     }
 }

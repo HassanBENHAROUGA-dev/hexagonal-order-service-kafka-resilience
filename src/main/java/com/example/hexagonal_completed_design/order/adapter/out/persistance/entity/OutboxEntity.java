@@ -19,6 +19,7 @@ public class OutboxEntity {
     @Id
     private UUID id;
 
+    @Getter
     private String aggregateId;
 
     @Getter @Setter

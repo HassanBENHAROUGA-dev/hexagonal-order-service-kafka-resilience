@@ -45,7 +45,7 @@ public class KafkaConfig {
     private static final int REPLICATION_FACTOR = 3;
     private static final String MIN_IN_SYNC_REPLICAS = "2";
 
-    private static final long RETRY_INTERVAL_MS = 1000L;
+    private static final long RETRY_INTERVAL_MS = 5000L;
     private static final long RETRY_ATTEMPTS = 3L;
 
     @Bean

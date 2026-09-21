@@ -38,7 +38,7 @@ public class OrderEventConsumer {
                     "Missing required Kafka header: " + EVENT_ID_HEADER
             );
         }
-        if (record.value().contains("99999999-9999-9999-9999-999999999999")) {
+        if (record.value().contains("99999999-9999-9999-9999-000111111111")) {
             System.out.println("💥 Erreur volontaire pour tester Retry + DLT");
             throw new RuntimeException("Test volontaire DLT");
         }
@@ -92,5 +92,14 @@ public class OrderEventConsumer {
     private void processBusinessEvent(String payload) {
         // Business processing will be implemented here.
         log.debug("Processing order event payload: {}", payload);
+
+        // pour le test du rollback
+        if (payload.contains(
+                "88888888-8888-8888-8888-888888888888"
+        )) {
+            throw new RuntimeException(
+                    "Intentional rollback test"
+            );
+        }
     }
 }

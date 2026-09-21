@@ -60,13 +60,6 @@ public class OutboxKafkaRelay {
     private void publishEvent(OutboxEntity entity) {
 
         try {
-            /*
-             * aggregateId is used as the Kafka key so that events belonging
-             * to the same aggregate are routed to the same partition.
-             *
-             * eventId is propagated as a Kafka header and is later used
-             * by consumers for idempotency and duplicate detection.
-             */
             ProducerRecord<Object, Object> record = new ProducerRecord<>(
                     TOPIC,
                     entity.getAggregateId(),
@@ -80,18 +73,19 @@ public class OutboxKafkaRelay {
                             .getBytes(StandardCharsets.UTF_8)
             );
 
-            /*
-             * Wait for Kafka to acknowledge the publication before marking
-             * the Outbox event as processed.
-             */
+            log.info(
+                    "➡️ Trying to publish Outbox event | eventId={} | aggregateId={}",
+                    entity.getId(),
+                    entity.getAggregateId()
+            );
+
             kafkaTemplate.send(record).get();
 
             entity.setProcessed(true);
             outboxRepository.save(entity);
 
             log.info(
-                    "Outbox event published successfully " +
-                            "[eventId={}, aggregateId={}, eventType={}]",
+                    "✅ OUTBOX EVENT PUBLISHED | eventId={} | aggregateId={} | eventType={}",
                     entity.getId(),
                     entity.getAggregateId(),
                     entity.getEventType()
@@ -99,16 +93,13 @@ public class OutboxKafkaRelay {
 
         } catch (Exception e) {
 
-            /*
-             * The event deliberately remains unprocessed.
-             * It will be selected again during a future relay execution.
-             */
             log.error(
-                    "❌ OUTBOX PUBLICATION FAILED | eventId={} | aggregateId={} | eventType={} | retry=next-poll",
+                    "❌ OUTBOX PUBLICATION FAILED | eventId={} | aggregateId={} | eventType={} | exception={} | message={} | retry=next-poll",
                     entity.getId(),
                     entity.getAggregateId(),
                     entity.getEventType(),
-                    e
+                    e.getClass().getSimpleName(),
+                    e.getMessage()
             );
         }
     }
